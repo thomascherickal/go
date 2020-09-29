@@ -27,7 +27,8 @@ var (
 	BuildBuildmode         string // -buildmode flag
 	BuildContext           = defaultContext()
 	BuildMod               string             // -mod flag
-	BuildModReason         string             // reason -mod flag is set, if set by default
+	BuildModExplicit       bool               // whether -mod was set explicitly
+	BuildModReason         string             // reason -mod was set, if set by default
 	BuildI                 bool               // -i flag
 	BuildLinkshared        bool               // -linkshared flag
 	BuildMSan              bool               // -msan flag
@@ -48,9 +49,12 @@ var (
 	ModCacheRW bool   // -modcacherw flag
 	ModFile    string // -modfile flag
 
+	Insecure bool // -insecure flag
+
 	CmdName string // "build", "install", "list", "mod tidy", etc.
 
 	DebugActiongraph string // -debug-actiongraph flag (undocumented, unstable)
+	DebugTrace       string // -debug-trace flag
 )
 
 func defaultContext() build.Context {
@@ -236,6 +240,7 @@ var (
 	GOROOTpkg    = filepath.Join(GOROOT, "pkg")
 	GOROOTsrc    = filepath.Join(GOROOT, "src")
 	GOROOT_FINAL = findGOROOT_FINAL()
+	GOMODCACHE   = envOr("GOMODCACHE", gopathDir("pkg/mod"))
 
 	// Used in envcmd.MkEnv and build ID computations.
 	GOARM    = envOr("GOARM", fmt.Sprint(objabi.GOARM))
@@ -252,6 +257,8 @@ var (
 	GONOSUMDB  = envOr("GONOSUMDB", GOPRIVATE)
 	GOINSECURE = Getenv("GOINSECURE")
 )
+
+var SumdbDir = gopathDir("pkg/sumdb")
 
 // GetArchEnv returns the name and setting of the
 // GOARCH-specific architecture environment variable.
@@ -363,4 +370,12 @@ func isGOROOT(path string) bool {
 		return false
 	}
 	return stat.IsDir()
+}
+
+func gopathDir(rel string) string {
+	list := filepath.SplitList(BuildContext.GOPATH)
+	if len(list) == 0 || list[0] == "" {
+		return ""
+	}
+	return filepath.Join(list[0], rel)
 }

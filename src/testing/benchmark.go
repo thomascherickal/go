@@ -69,8 +69,8 @@ var benchmarkLock sync.Mutex
 // Used for every benchmark for measuring memory.
 var memStats runtime.MemStats
 
-// An internal type but exported because it is cross-package; part of the implementation
-// of the "go test" command.
+// InternalBenchmark is an internal type but exported because it is cross-package;
+// it is part of the implementation of the "go test" command.
 type InternalBenchmark struct {
 	Name string
 	F    func(b *B)
@@ -86,7 +86,7 @@ type InternalBenchmark struct {
 // may be called simultaneously from multiple goroutines.
 //
 // Like in tests, benchmark logs are accumulated during execution
-// and dumped to standard error when done. Unlike in tests, benchmark logs
+// and dumped to standard output when done. Unlike in tests, benchmark logs
 // are always printed, so as not to hide output whose existence may be
 // affecting benchmark results.
 type B struct {
@@ -179,6 +179,7 @@ func (b *B) ReportAllocs() {
 func (b *B) runN(n int) {
 	benchmarkLock.Lock()
 	defer benchmarkLock.Unlock()
+	defer b.runCleanup(normalPanic)
 	// Try to get a comparable environment for each run
 	// by clearing garbage from previous runs.
 	runtime.GC()
@@ -241,7 +242,7 @@ func (b *B) run1() bool {
 		if b.skipped {
 			tag = "SKIP"
 		}
-		if b.chatty && (len(b.output) > 0 || b.finished) {
+		if b.chatty != nil && (len(b.output) > 0 || b.finished) {
 			b.trimOutput()
 			fmt.Fprintf(b.w, "--- %s: %s\n%s", tag, b.name, b.output)
 		}
@@ -342,7 +343,7 @@ func (b *B) ReportMetric(n float64, unit string) {
 	b.extra[unit] = n
 }
 
-// The results of a benchmark run.
+// BenchmarkResult contains the results of a benchmark run.
 type BenchmarkResult struct {
 	N         int           // The number of iterations.
 	T         time.Duration // The total time taken.
@@ -488,8 +489,8 @@ type benchContext struct {
 	extLen int // Maximum extension length.
 }
 
-// An internal function but exported because it is cross-package; part of the implementation
-// of the "go test" command.
+// RunBenchmarks is an internal function but exported because it is cross-package;
+// it is part of the implementation of the "go test" command.
 func RunBenchmarks(matchString func(pat, str string) (bool, error), benchmarks []InternalBenchmark) {
 	runBenchmarks("", matchString, benchmarks)
 }
@@ -522,9 +523,9 @@ func runBenchmarks(importPath string, matchString func(pat, str string) (bool, e
 	}
 	main := &B{
 		common: common{
-			name:   "Main",
-			w:      os.Stdout,
-			chatty: *chatty,
+			name:  "Main",
+			w:     os.Stdout,
+			bench: true,
 		},
 		importPath: importPath,
 		benchFunc: func(b *B) {
@@ -534,6 +535,9 @@ func runBenchmarks(importPath string, matchString func(pat, str string) (bool, e
 		},
 		benchTime: benchTime,
 		context:   ctx,
+	}
+	if Verbose() {
+		main.chatty = newChattyPrinter(main.w)
 	}
 	main.runN(1)
 	return !main.failed
@@ -547,7 +551,7 @@ func (ctx *benchContext) processBench(b *B) {
 			benchName := benchmarkName(b.name, procs)
 
 			// If it's chatty, we've already printed this information.
-			if !b.chatty {
+			if b.chatty == nil {
 				fmt.Fprintf(b.w, "%-*s\t", ctx.maxLen, benchName)
 			}
 			// Recompute the running time for all but the first iteration.
@@ -558,6 +562,7 @@ func (ctx *benchContext) processBench(b *B) {
 						name:   b.name,
 						w:      b.w,
 						chatty: b.chatty,
+						bench:  true,
 					},
 					benchFunc: b.benchFunc,
 					benchTime: b.benchTime,
@@ -573,7 +578,7 @@ func (ctx *benchContext) processBench(b *B) {
 				continue
 			}
 			results := r.String()
-			if b.chatty {
+			if b.chatty != nil {
 				fmt.Fprintf(b.w, "%-*s\t", ctx.maxLen, benchName)
 			}
 			if *benchmarkMemory || b.showAllocResult {
@@ -623,6 +628,7 @@ func (b *B) Run(name string, f func(b *B)) bool {
 			creator: pc[:n],
 			w:       b.w,
 			chatty:  b.chatty,
+			bench:   true,
 		},
 		importPath: b.importPath,
 		benchFunc:  f,
@@ -635,7 +641,7 @@ func (b *B) Run(name string, f func(b *B)) bool {
 		atomic.StoreInt32(&sub.hasSub, 1)
 	}
 
-	if b.chatty {
+	if b.chatty != nil {
 		labelsOnce.Do(func() {
 			fmt.Printf("goos: %s\n", runtime.GOOS)
 			fmt.Printf("goarch: %s\n", runtime.GOARCH)

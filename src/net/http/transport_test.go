@@ -25,6 +25,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	mrand "math/rand"
 	"net"
 	. "net/http"
 	"net/http/httptest"
@@ -41,6 +42,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -451,14 +453,23 @@ func TestTransportReadToEndReusesConn(t *testing.T) {
 
 func TestTransportMaxPerHostIdleConns(t *testing.T) {
 	defer afterTest(t)
+	stop := make(chan struct{}) // stop marks the exit of main Test goroutine
+	defer close(stop)
+
 	resch := make(chan string)
 	gotReq := make(chan bool)
 	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
 		gotReq <- true
-		msg := <-resch
+		var msg string
+		select {
+		case <-stop:
+			return
+		case msg = <-resch:
+		}
 		_, err := w.Write([]byte(msg))
 		if err != nil {
-			t.Fatalf("Write: %v", err)
+			t.Errorf("Write: %v", err)
+			return
 		}
 	}))
 	defer ts.Close()
@@ -472,6 +483,13 @@ func TestTransportMaxPerHostIdleConns(t *testing.T) {
 	// Their responses will hang until we write to resch, though.
 	donech := make(chan bool)
 	doReq := func() {
+		defer func() {
+			select {
+			case <-stop:
+				return
+			case donech <- t.Failed():
+			}
+		}()
 		resp, err := c.Get(ts.URL)
 		if err != nil {
 			t.Error(err)
@@ -481,7 +499,6 @@ func TestTransportMaxPerHostIdleConns(t *testing.T) {
 			t.Errorf("ReadAll: %v", err)
 			return
 		}
-		donech <- true
 	}
 	go doReq()
 	<-gotReq
@@ -842,7 +859,9 @@ func TestStressSurpriseServerCloses(t *testing.T) {
 					// where we won the race.
 					res.Body.Close()
 				}
-				activityc <- true
+				if !<-activityc { // Receives false when close(activityc) is executed
+					return
+				}
 			}
 		}()
 	}
@@ -850,8 +869,9 @@ func TestStressSurpriseServerCloses(t *testing.T) {
 	// Make sure all the request come back, one way or another.
 	for i := 0; i < numClients*reqsPerClient; i++ {
 		select {
-		case <-activityc:
+		case activityc <- true:
 		case <-time.After(5 * time.Second):
+			close(activityc)
 			t.Fatalf("presumed deadlock; no HTTP client activity seen in awhile")
 		}
 	}
@@ -1442,6 +1462,72 @@ func TestTransportProxy(t *testing.T) {
 	}
 }
 
+// Issue 28012: verify that the Transport closes its TCP connection to http proxies
+// when they're slow to reply to HTTPS CONNECT responses.
+func TestTransportProxyHTTPSConnectLeak(t *testing.T) {
+	setParallel(t)
+	defer afterTest(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln := newLocalListener(t)
+	defer ln.Close()
+	listenerDone := make(chan struct{})
+	go func() {
+		defer close(listenerDone)
+		c, err := ln.Accept()
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+			return
+		}
+		defer c.Close()
+		// Read the CONNECT request
+		br := bufio.NewReader(c)
+		cr, err := ReadRequest(br)
+		if err != nil {
+			t.Errorf("proxy server failed to read CONNECT request")
+			return
+		}
+		if cr.Method != "CONNECT" {
+			t.Errorf("unexpected method %q", cr.Method)
+			return
+		}
+
+		// Now hang and never write a response; instead, cancel the request and wait
+		// for the client to close.
+		// (Prior to Issue 28012 being fixed, we never closed.)
+		cancel()
+		var buf [1]byte
+		_, err = br.Read(buf[:])
+		if err != io.EOF {
+			t.Errorf("proxy server Read err = %v; want EOF", err)
+		}
+		return
+	}()
+
+	c := &Client{
+		Transport: &Transport{
+			Proxy: func(*Request) (*url.URL, error) {
+				return url.Parse("http://" + ln.Addr().String())
+			},
+		},
+	}
+	req, err := NewRequestWithContext(ctx, "GET", "https://golang.fake.tld/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Do(req)
+	if err == nil {
+		t.Errorf("unexpected Get success")
+	}
+
+	// Wait unconditionally for the listener goroutine to exit: this should never
+	// hang, so if it does we want a full goroutine dump — and that's exactly what
+	// the testing package will give us when the test run times out.
+	<-listenerDone
+}
+
 // Issue 16997: test transport dial preserves typed errors
 func TestTransportDialPreservesNetOpProxyError(t *testing.T) {
 	defer afterTest(t)
@@ -1481,6 +1567,44 @@ func TestTransportDialPreservesNetOpProxyError(t *testing.T) {
 	}
 	if !reflect.DeepEqual(oe, want) {
 		t.Errorf("Got error %#v; want %#v", oe, want)
+	}
+}
+
+// Issue 36431: calls to RoundTrip should not mutate t.ProxyConnectHeader.
+//
+// (A bug caused dialConn to instead write the per-request Proxy-Authorization
+// header through to the shared Header instance, introducing a data race.)
+func TestTransportProxyDialDoesNotMutateProxyConnectHeader(t *testing.T) {
+	setParallel(t)
+	defer afterTest(t)
+
+	proxy := httptest.NewTLSServer(NotFoundHandler())
+	defer proxy.Close()
+	c := proxy.Client()
+
+	tr := c.Transport.(*Transport)
+	tr.Proxy = func(*Request) (*url.URL, error) {
+		u, _ := url.Parse(proxy.URL)
+		u.User = url.UserPassword("aladdin", "opensesame")
+		return u, nil
+	}
+	h := tr.ProxyConnectHeader
+	if h == nil {
+		h = make(Header)
+	}
+	tr.ProxyConnectHeader = h.Clone()
+
+	req, err := NewRequest("GET", "https://golang.fake.tld/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Do(req)
+	if err == nil {
+		t.Errorf("unexpected Get success")
+	}
+
+	if !reflect.DeepEqual(tr.ProxyConnectHeader, h) {
+		t.Errorf("tr.ProxyConnectHeader = %v; want %v", tr.ProxyConnectHeader, h)
 	}
 }
 
@@ -2242,6 +2366,50 @@ func TestTransportCancelRequest(t *testing.T) {
 	}
 }
 
+func testTransportCancelRequestInDo(t *testing.T, body io.Reader) {
+	setParallel(t)
+	defer afterTest(t)
+	if testing.Short() {
+		t.Skip("skipping test in -short mode")
+	}
+	unblockc := make(chan bool)
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		<-unblockc
+	}))
+	defer ts.Close()
+	defer close(unblockc)
+
+	c := ts.Client()
+	tr := c.Transport.(*Transport)
+
+	donec := make(chan bool)
+	req, _ := NewRequest("GET", ts.URL, body)
+	go func() {
+		defer close(donec)
+		c.Do(req)
+	}()
+	start := time.Now()
+	timeout := 10 * time.Second
+	for time.Since(start) < timeout {
+		time.Sleep(100 * time.Millisecond)
+		tr.CancelRequest(req)
+		select {
+		case <-donec:
+			return
+		default:
+		}
+	}
+	t.Errorf("Do of canceled request has not returned after %v", timeout)
+}
+
+func TestTransportCancelRequestInDo(t *testing.T) {
+	testTransportCancelRequestInDo(t, nil)
+}
+
+func TestTransportCancelRequestWithBodyInDo(t *testing.T) {
+	testTransportCancelRequestInDo(t, bytes.NewBuffer([]byte{0}))
+}
+
 func TestTransportCancelRequestInDial(t *testing.T) {
 	defer afterTest(t)
 	if testing.Short() {
@@ -2257,7 +2425,9 @@ func TestTransportCancelRequestInDial(t *testing.T) {
 	tr := &Transport{
 		Dial: func(network, addr string) (net.Conn, error) {
 			eventLog.Println("dial: blocking")
-			inDial <- true
+			if !<-inDial {
+				return nil, errors.New("main Test goroutine exited")
+			}
 			<-unblockDial
 			return nil, errors.New("nope")
 		},
@@ -2272,8 +2442,9 @@ func TestTransportCancelRequestInDial(t *testing.T) {
 	}()
 
 	select {
-	case <-inDial:
+	case inDial <- true:
 	case <-time.After(5 * time.Second):
+		close(inDial)
 		t.Fatal("timeout; never saw blocking dial")
 	}
 
@@ -3239,12 +3410,6 @@ func TestTransportIssue10457(t *testing.T) {
 	}
 }
 
-type errorReader struct {
-	err error
-}
-
-func (e errorReader) Read(p []byte) (int, error) { return 0, e.err }
-
 type closerFunc func() error
 
 func (f closerFunc) Close() error { return f() }
@@ -3386,7 +3551,8 @@ func TestRetryRequestsOnError(t *testing.T) {
 
 			for i := 0; i < 3; i++ {
 				t0 := time.Now()
-				res, err := c.Do(tc.req())
+				req := tc.req()
+				res, err := c.Do(req)
 				if err != nil {
 					if time.Since(t0) < MaxWriteWaitBeforeConnReuse/2 {
 						mu.Lock()
@@ -3397,6 +3563,9 @@ func TestRetryRequestsOnError(t *testing.T) {
 					t.Skipf("connection likely wasn't recycled within %d, interfering with actual test; skipping", MaxWriteWaitBeforeConnReuse)
 				}
 				res.Body.Close()
+				if res.Request != req {
+					t.Errorf("Response.Request != original request; want identical Request")
+				}
 			}
 
 			mu.Lock()
@@ -3437,7 +3606,7 @@ func TestTransportClosesBodyOnError(t *testing.T) {
 		io.Reader
 		io.Closer
 	}{
-		io.MultiReader(io.LimitReader(neverEnding('x'), 1<<20), errorReader{fakeErr}),
+		io.MultiReader(io.LimitReader(neverEnding('x'), 1<<20), iotest.ErrReader(fakeErr)),
 		closerFunc(func() error {
 			select {
 			case didClose <- true:
@@ -6037,5 +6206,180 @@ func TestTransportDecrementConnWhenIdleConnRemoved(t *testing.T) {
 
 	for err := range errCh {
 		t.Errorf("error occurred: %v", err)
+	}
+}
+
+// Issue 36820
+// Test that we use the older backward compatible cancellation protocol
+// when a RoundTripper is registered via RegisterProtocol.
+func TestAltProtoCancellation(t *testing.T) {
+	defer afterTest(t)
+	tr := &Transport{}
+	c := &Client{
+		Transport: tr,
+		Timeout:   time.Millisecond,
+	}
+	tr.RegisterProtocol("timeout", timeoutProto{})
+	_, err := c.Get("timeout://bar.com/path")
+	if err == nil {
+		t.Error("request unexpectedly succeeded")
+	} else if !strings.Contains(err.Error(), timeoutProtoErr.Error()) {
+		t.Errorf("got error %q, does not contain expected string %q", err, timeoutProtoErr)
+	}
+}
+
+var timeoutProtoErr = errors.New("canceled as expected")
+
+type timeoutProto struct{}
+
+func (timeoutProto) RoundTrip(req *Request) (*Response, error) {
+	select {
+	case <-req.Cancel:
+		return nil, timeoutProtoErr
+	case <-time.After(5 * time.Second):
+		return nil, errors.New("request was not canceled")
+	}
+}
+
+type roundTripFunc func(r *Request) (*Response, error)
+
+func (f roundTripFunc) RoundTrip(r *Request) (*Response, error) { return f(r) }
+
+// Issue 32441: body is not reset after ErrSkipAltProtocol
+func TestIssue32441(t *testing.T) {
+	defer afterTest(t)
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		if n, _ := io.Copy(ioutil.Discard, r.Body); n == 0 {
+			t.Error("body length is zero")
+		}
+	}))
+	defer ts.Close()
+	c := ts.Client()
+	c.Transport.(*Transport).RegisterProtocol("http", roundTripFunc(func(r *Request) (*Response, error) {
+		// Draining body to trigger failure condition on actual request to server.
+		if n, _ := io.Copy(ioutil.Discard, r.Body); n == 0 {
+			t.Error("body length is zero during round trip")
+		}
+		return nil, ErrSkipAltProtocol
+	}))
+	if _, err := c.Post(ts.URL, "application/octet-stream", bytes.NewBufferString("data")); err != nil {
+		t.Error(err)
+	}
+}
+
+// Issue 39017. Ensure that HTTP/1 transports reject Content-Length headers
+// that contain a sign (eg. "+3"), per RFC 2616, Section 14.13.
+func TestTransportRejectsSignInContentLength(t *testing.T) {
+	cst := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Content-Length", "+3")
+		w.Write([]byte("abc"))
+	}))
+	defer cst.Close()
+
+	c := cst.Client()
+	res, err := c.Get(cst.URL)
+	if err == nil || res != nil {
+		t.Fatal("Expected a non-nil error and a nil http.Response")
+	}
+	if got, want := err.Error(), `bad Content-Length "+3"`; !strings.Contains(got, want) {
+		t.Fatalf("Error mismatch\nGot: %q\nWanted substring: %q", got, want)
+	}
+}
+
+// dumpConn is a net.Conn which writes to Writer and reads from Reader
+type dumpConn struct {
+	io.Writer
+	io.Reader
+}
+
+func (c *dumpConn) Close() error                       { return nil }
+func (c *dumpConn) LocalAddr() net.Addr                { return nil }
+func (c *dumpConn) RemoteAddr() net.Addr               { return nil }
+func (c *dumpConn) SetDeadline(t time.Time) error      { return nil }
+func (c *dumpConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *dumpConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// delegateReader is a reader that delegates to another reader,
+// once it arrives on a channel.
+type delegateReader struct {
+	c chan io.Reader
+	r io.Reader // nil until received from c
+}
+
+func (r *delegateReader) Read(p []byte) (int, error) {
+	if r.r == nil {
+		var ok bool
+		if r.r, ok = <-r.c; !ok {
+			return 0, errors.New("delegate closed")
+		}
+	}
+	return r.r.Read(p)
+}
+
+func testTransportRace(req *Request) {
+	save := req.Body
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	dr := &delegateReader{c: make(chan io.Reader)}
+
+	t := &Transport{
+		Dial: func(net, addr string) (net.Conn, error) {
+			return &dumpConn{pw, dr}, nil
+		},
+	}
+	defer t.CloseIdleConnections()
+
+	quitReadCh := make(chan struct{})
+	// Wait for the request before replying with a dummy response:
+	go func() {
+		defer close(quitReadCh)
+
+		req, err := ReadRequest(bufio.NewReader(pr))
+		if err == nil {
+			// Ensure all the body is read; otherwise
+			// we'll get a partial dump.
+			io.Copy(ioutil.Discard, req.Body)
+			req.Body.Close()
+		}
+		select {
+		case dr.c <- strings.NewReader("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"):
+		case quitReadCh <- struct{}{}:
+			// Ensure delegate is closed so Read doesn't block forever.
+			close(dr.c)
+		}
+	}()
+
+	t.RoundTrip(req)
+
+	// Ensure the reader returns before we reset req.Body to prevent
+	// a data race on req.Body.
+	pw.Close()
+	<-quitReadCh
+
+	req.Body = save
+}
+
+// Issue 37669
+// Test that a cancellation doesn't result in a data race due to the writeLoop
+// goroutine being left running, if the caller mutates the processed Request
+// upon completion.
+func TestErrorWriteLoopRace(t *testing.T) {
+	if testing.Short() {
+		return
+	}
+	t.Parallel()
+	for i := 0; i < 1000; i++ {
+		delay := time.Duration(mrand.Intn(5)) * time.Millisecond
+		ctx, cancel := context.WithTimeout(context.Background(), delay)
+		defer cancel()
+
+		r := bytes.NewBuffer(make([]byte, 10000))
+		req, err := NewRequestWithContext(ctx, MethodPost, "http://example.com", r)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		testTransportRace(req)
 	}
 }

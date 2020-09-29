@@ -141,13 +141,13 @@ func isSelfAssign(dst, src *Node) bool {
 	return samesafeexpr(dst.Left, src.Left)
 }
 
-// mayAffectMemory reports whether n evaluation may affect program memory state.
-// If expression can't affect it, then it can be safely ignored by the escape analysis.
+// mayAffectMemory reports whether evaluation of n may affect the program's
+// memory state. If the expression can't affect memory state, then it can be
+// safely ignored by the escape analysis.
 func mayAffectMemory(n *Node) bool {
-	// We may want to use "memory safe" black list instead of general
-	// "side-effect free", which can include all calls and other ops
-	// that can affect allocate or change global state.
-	// It's safer to start from a whitelist for now.
+	// We may want to use a list of "memory safe" ops instead of generally
+	// "side-effect free", which would include all calls and other ops that can
+	// allocate or change global state. For now, it's safer to start with the latter.
 	//
 	// We're ignoring things like division by zero, index out of range,
 	// and nil pointer dereference here.
@@ -184,6 +184,13 @@ func mustHeapAlloc(n *Node) bool {
 	}
 
 	if (n.Op == ONEW || n.Op == OPTRLIT) && n.Type.Elem().Width >= maxImplicitStackVarSize {
+		return true
+	}
+
+	if n.Op == OCLOSURE && closureType(n).Size() >= maxImplicitStackVarSize {
+		return true
+	}
+	if n.Op == OCALLPART && partialCallType(n).Size() >= maxImplicitStackVarSize {
 		return true
 	}
 
@@ -370,14 +377,14 @@ func (e *Escape) paramTag(fn *Node, narg int, f *types.Field) string {
 		// This really doesn't have much to do with escape analysis per se,
 		// but we are reusing the ability to annotate an individual function
 		// argument and pass those annotations along to importing code.
-		if f.Type.Etype == TUINTPTR {
+		if f.Type.IsUintptr() {
 			if Debug['m'] != 0 {
 				Warnl(f.Pos, "assuming %v is unsafe uintptr", name())
 			}
 			return unsafeUintptrTag
 		}
 
-		if !types.Haspointers(f.Type) { // don't bother tagging for scalars
+		if !f.Type.HasPointers() { // don't bother tagging for scalars
 			return ""
 		}
 
@@ -400,13 +407,13 @@ func (e *Escape) paramTag(fn *Node, narg int, f *types.Field) string {
 	}
 
 	if fn.Func.Pragma&UintptrEscapes != 0 {
-		if f.Type.Etype == TUINTPTR {
+		if f.Type.IsUintptr() {
 			if Debug['m'] != 0 {
 				Warnl(f.Pos, "marking %v as escaping uintptr", name())
 			}
 			return uintptrEscapesTag
 		}
-		if f.IsDDD() && f.Type.Elem().Etype == TUINTPTR {
+		if f.IsDDD() && f.Type.Elem().IsUintptr() {
 			// final argument is ...uintptr.
 			if Debug['m'] != 0 {
 				Warnl(f.Pos, "marking %v as escaping ...uintptr", name())
@@ -415,7 +422,7 @@ func (e *Escape) paramTag(fn *Node, narg int, f *types.Field) string {
 		}
 	}
 
-	if !types.Haspointers(f.Type) { // don't bother tagging for scalars
+	if !f.Type.HasPointers() { // don't bother tagging for scalars
 		return ""
 	}
 

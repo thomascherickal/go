@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"cmd/go/internal/cfg"
-	"cmd/go/internal/get"
 	"cmd/go/internal/modfetch/codehost"
 	"cmd/go/internal/par"
-	"cmd/go/internal/str"
+	"cmd/go/internal/vcs"
 	web "cmd/go/internal/web"
 
+	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 )
 
@@ -217,7 +217,7 @@ func lookup(proxy, path string) (r Repo, err error) {
 		return nil, errLookupDisabled
 	}
 
-	if str.GlobsMatchPath(cfg.GONOPROXY, path) {
+	if module.MatchPrefixPatterns(cfg.GONOPROXY, path) {
 		switch proxy {
 		case "noproxy", "direct":
 			return lookupDirect(path)
@@ -250,9 +250,9 @@ func (lookupDisabledError) Error() string {
 var errLookupDisabled error = lookupDisabledError{}
 
 var (
-	errProxyOff       = notExistError("module lookup disabled by GOPROXY=off")
-	errNoproxy  error = notExistError("disabled by GOPRIVATE/GONOPROXY")
-	errUseProxy error = notExistError("path does not match GOPRIVATE/GONOPROXY")
+	errProxyOff       = notExistErrorf("module lookup disabled by GOPROXY=off")
+	errNoproxy  error = notExistErrorf("disabled by GOPRIVATE/GONOPROXY")
+	errUseProxy error = notExistErrorf("path does not match GOPRIVATE/GONOPROXY")
 )
 
 func lookupDirect(path string) (Repo, error) {
@@ -261,13 +261,13 @@ func lookupDirect(path string) (Repo, error) {
 	if allowInsecure(path) {
 		security = web.Insecure
 	}
-	rr, err := get.RepoRootForImportPath(path, get.PreferMod, security)
+	rr, err := vcs.RepoRootForImportPath(path, vcs.PreferMod, security)
 	if err != nil {
 		// We don't know where to find code for a module with this path.
-		return nil, notExistError(err.Error())
+		return nil, notExistError{err: err}
 	}
 
-	if rr.VCS == "mod" {
+	if rr.VCS.Name == "mod" {
 		// Fetch module from proxy with base URL rr.Repo.
 		return newProxyRepo(rr.Repo, path)
 	}
@@ -279,8 +279,8 @@ func lookupDirect(path string) (Repo, error) {
 	return newCodeRepo(code, rr.Root, path)
 }
 
-func lookupCodeRepo(rr *get.RepoRoot) (codehost.Repo, error) {
-	code, err := codehost.NewRepo(rr.VCS, rr.Repo)
+func lookupCodeRepo(rr *vcs.RepoRoot) (codehost.Repo, error) {
+	code, err := codehost.NewRepo(rr.VCS.Cmd, rr.Repo)
 	if err != nil {
 		if _, ok := err.(*codehost.VCSError); ok {
 			return nil, err
@@ -306,7 +306,7 @@ func ImportRepoRev(path, rev string) (Repo, *RevInfo, error) {
 	if allowInsecure(path) {
 		security = web.Insecure
 	}
-	rr, err := get.RepoRootForImportPath(path, get.IgnoreMod, security)
+	rr, err := vcs.RepoRootForImportPath(path, vcs.IgnoreMod, security)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -408,11 +408,22 @@ func (l *loggingRepo) Zip(dst io.Writer, version string) error {
 }
 
 // A notExistError is like os.ErrNotExist, but with a custom message
-type notExistError string
+type notExistError struct {
+	err error
+}
+
+func notExistErrorf(format string, args ...interface{}) error {
+	return notExistError{fmt.Errorf(format, args...)}
+}
 
 func (e notExistError) Error() string {
-	return string(e)
+	return e.err.Error()
 }
+
 func (notExistError) Is(target error) bool {
 	return target == os.ErrNotExist
+}
+
+func (e notExistError) Unwrap() error {
+	return e.err
 }

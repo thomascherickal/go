@@ -220,7 +220,7 @@ TEXT runtime·mincore(SB),NOSPLIT,$0-16
 	RET
 
 // func walltime1() (sec int64, nsec int32)
-TEXT runtime·walltime1(SB), NOSPLIT, $0-12
+TEXT runtime·walltime1(SB), NOSPLIT, $8-12
 	// We don't know how much stack space the VDSO code will need,
 	// so switch to g0.
 
@@ -231,9 +231,16 @@ TEXT runtime·walltime1(SB), NOSPLIT, $0-12
 	MOVL	g_m(AX), SI // SI unchanged by C code.
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
-	MOVL	0(SP), DX
-	MOVL	DX, m_vdsoPC(SI)
-	LEAL	sec+0(SP), DX
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVL	m_vdsoPC(SI), CX
+	MOVL	m_vdsoSP(SI), DX
+	MOVL	CX, 0(SP)
+	MOVL	DX, 4(SP)
+
+	LEAL	sec+0(FP), DX
+	MOVL	-4(DX), CX
+	MOVL	CX, m_vdsoPC(SI)
 	MOVL	DX, m_vdsoSP(SI)
 
 	CMPL	AX, m_curg(SI)	// Only switch if on curg.
@@ -274,7 +281,15 @@ finish:
 	MOVL	12(SP), BX	// nsec
 
 	MOVL	BP, SP		// Restore real SP
-	MOVL	$0, m_vdsoSP(SI)
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVL	4(SP), CX
+	MOVL	CX, m_vdsoSP(SI)
+	MOVL	0(SP), CX
+	MOVL	CX, m_vdsoPC(SI)
 
 	// sec is in AX, nsec in BX
 	MOVL	AX, sec_lo+0(FP)
@@ -284,7 +299,7 @@ finish:
 
 // int64 nanotime(void) so really
 // void nanotime(int64 *nsec)
-TEXT runtime·nanotime1(SB), NOSPLIT, $0-8
+TEXT runtime·nanotime1(SB), NOSPLIT, $8-8
 	// Switch to g0 stack. See comment above in runtime·walltime.
 
 	MOVL	SP, BP	// Save old SP; BP unchanged by C code.
@@ -294,9 +309,16 @@ TEXT runtime·nanotime1(SB), NOSPLIT, $0-8
 	MOVL	g_m(AX), SI // SI unchanged by C code.
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
-	MOVL	0(SP), DX
-	MOVL	DX, m_vdsoPC(SI)
-	LEAL	ret+0(SP), DX
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVL	m_vdsoPC(SI), CX
+	MOVL	m_vdsoSP(SI), DX
+	MOVL	CX, 0(SP)
+	MOVL	DX, 4(SP)
+
+	LEAL	ret+0(FP), DX
+	MOVL	-4(DX), CX
+	MOVL	CX, m_vdsoPC(SI)
 	MOVL	DX, m_vdsoSP(SI)
 
 	CMPL	AX, m_curg(SI)	// Only switch if on curg.
@@ -330,7 +352,15 @@ finish:
 	MOVL	12(SP), BX	// nsec
 
 	MOVL	BP, SP		// Restore real SP
-	MOVL	$0, m_vdsoSP(SI)
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVL	4(SP), CX
+	MOVL	CX, m_vdsoSP(SI)
+	MOVL	0(SP), CX
+	MOVL	CX, m_vdsoPC(SI)
 
 	// sec is in AX, nsec in BX
 	// convert to DX:AX nsec

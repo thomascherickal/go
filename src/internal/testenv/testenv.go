@@ -45,8 +45,8 @@ func HasGoBuild() bool {
 	switch runtime.GOOS {
 	case "android", "js":
 		return false
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
+	case "darwin", "ios":
+		if runtime.GOARCH == "arm64" {
 			return false
 		}
 	}
@@ -124,8 +124,8 @@ func HasExec() bool {
 	switch runtime.GOOS {
 	case "js":
 		return false
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
+	case "darwin", "ios":
+		if runtime.GOARCH == "arm64" {
 			return false
 		}
 	}
@@ -135,8 +135,8 @@ func HasExec() bool {
 // HasSrc reports whether the entire source tree is available under GOROOT.
 func HasSrc() bool {
 	switch runtime.GOOS {
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
+	case "darwin", "ios":
+		if runtime.GOARCH == "arm64" {
 			return false
 		}
 	}

@@ -90,6 +90,11 @@ import (
 type cgoCallers [32]uintptr
 
 // Call from Go to C.
+//
+// This must be nosplit because it's used for syscalls on some
+// platforms. Syscalls may have untyped arguments on the stack, so
+// it's not safe to grow or scan the stack.
+//
 //go:nosplit
 func cgocall(fn, arg unsafe.Pointer) int32 {
 	if !iscgo && GOOS != "solaris" && GOOS != "illumos" && GOOS != "windows" {
@@ -127,6 +132,13 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 	// saved by entersyscall here.
 	entersyscall()
 
+	// Tell asynchronous preemption that we're entering external
+	// code. We do this after entersyscall because this may block
+	// and cause an async preemption to fail, but at this point a
+	// sync preemption will succeed (though this is not a matter
+	// of correctness).
+	osPreemptExtEnter(mp)
+
 	mp.incgo = true
 	errno := asmcgocall(fn, arg)
 
@@ -134,6 +146,8 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 	// reschedule us on to a different M.
 	mp.incgo = false
 	mp.ncgo--
+
+	osPreemptExtExit(mp)
 
 	exitsyscall()
 
@@ -188,11 +202,15 @@ func cgocallbackg(ctxt uintptr) {
 	exitsyscall() // coming out of cgo call
 	gp.m.incgo = false
 
+	osPreemptExtExit(gp.m)
+
 	cgocallbackg1(ctxt)
 
 	// At this point unlockOSThread has been called.
 	// The following code must not change to a different m.
 	// This is enforced by checking incgo in the schedule function.
+
+	osPreemptExtEnter(gp.m)
 
 	gp.m.incgo = true
 	// going back to cgo call
@@ -268,13 +286,8 @@ func cgocallbackg1(ctxt uintptr) {
 		// Additional two words (16-byte alignment) are for saving FP.
 		cb = (*args)(unsafe.Pointer(sp + 7*sys.PtrSize))
 	case "amd64":
-		// On amd64, stack frame is two words, plus caller PC.
-		if framepointer_enabled {
-			// In this case, there's also saved BP.
-			cb = (*args)(unsafe.Pointer(sp + 4*sys.PtrSize))
-			break
-		}
-		cb = (*args)(unsafe.Pointer(sp + 3*sys.PtrSize))
+		// On amd64, stack frame is two words, plus caller PC and BP.
+		cb = (*args)(unsafe.Pointer(sp + 4*sys.PtrSize))
 	case "386":
 		// On 386, stack frame is three words, plus caller PC.
 		cb = (*args)(unsafe.Pointer(sp + 4*sys.PtrSize))
@@ -352,6 +365,7 @@ func unwindm(restore *bool) {
 		if mp.ncgo > 0 {
 			mp.incgo = false
 			mp.ncgo--
+			osPreemptExtExit(mp)
 		}
 
 		releasem(mp)
@@ -586,7 +600,7 @@ func cgoCheckUnknownPointer(p unsafe.Pointer, msg string) (base, i uintptr) {
 		hbits := heapBitsForAddr(base)
 		n := span.elemsize
 		for i = uintptr(0); i < n; i += sys.PtrSize {
-			if i != 1*sys.PtrSize && !hbits.morePointers() {
+			if !hbits.morePointers() {
 				// No more possible pointers.
 				break
 			}

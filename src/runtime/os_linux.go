@@ -116,6 +116,13 @@ const (
 	_CLONE_NEWUTS         = 0x4000000
 	_CLONE_NEWIPC         = 0x8000000
 
+	// As of QEMU 2.8.0 (5ea2fc84d), user emulation requires all six of these
+	// flags to be set when creating a thread; attempts to share the other
+	// five but leave SYSVSEM unshared will fail with -EINVAL.
+	//
+	// In non-QEMU environments CLONE_SYSVSEM is inconsequential as we do not
+	// use System V semaphores.
+
 	cloneFlags = _CLONE_VM | /* share memory */
 		_CLONE_FS | /* share cwd, etc */
 		_CLONE_FILES | /* share fd table */
@@ -241,6 +248,10 @@ func sysargs(argc int32, argv **byte) {
 	sysauxv(buf[:])
 }
 
+// startupRandomData holds random bytes initialized at startup. These come from
+// the ELF AT_RANDOM auxiliary vector.
+var startupRandomData []byte
+
 func sysauxv(auxv []uintptr) int {
 	var i int
 	for ; auxv[i] != _AT_NULL; i += 2 {
@@ -269,13 +280,14 @@ func getHugePageSize() uintptr {
 	if fd < 0 {
 		return 0
 	}
-	n := read(fd, noescape(unsafe.Pointer(&numbuf[0])), int32(len(numbuf)))
+	ptr := noescape(unsafe.Pointer(&numbuf[0]))
+	n := read(fd, ptr, int32(len(numbuf)))
 	closefd(fd)
 	if n <= 0 {
 		return 0
 	}
-	l := n - 1 // remove trailing newline
-	v, ok := atoi(slicebytetostringtmp(numbuf[:l]))
+	n-- // remove trailing newline
+	v, ok := atoi(slicebytetostringtmp((*byte)(ptr), int(n)))
 	if !ok || v < 0 {
 		v = 0
 	}
@@ -289,6 +301,7 @@ func getHugePageSize() uintptr {
 func osinit() {
 	ncpu = getproccount()
 	physHugePageSize = getHugePageSize()
+	osArchInit()
 }
 
 var urandom_dev = []byte("/dev/urandom\x00")
@@ -333,7 +346,7 @@ func minit() {
 	minitSignals()
 
 	// Cgo-created threads and the bootstrap m are missing a
-	// procid. We need this for asynchronous preemption and its
+	// procid. We need this for asynchronous preemption and it's
 	// useful in debuggers.
 	getg().m.procid = uint64(gettid())
 }

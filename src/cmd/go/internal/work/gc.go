@@ -25,6 +25,9 @@ import (
 	"crypto/sha1"
 )
 
+// The 'path' used for GOROOT_FINAL when -trimpath is specified
+const trimPathGoRootFinal = "go"
+
 // The Go toolchain.
 
 type gcToolchain struct{}
@@ -37,6 +40,17 @@ func (gcToolchain) linker() string {
 	return base.Tool("link")
 }
 
+func pkgPath(a *Action) string {
+	p := a.Package
+	ppath := p.ImportPath
+	if cfg.BuildBuildmode == "plugin" {
+		ppath = pluginPath(a)
+	} else if p.Name == "main" && !p.Internal.ForceLibrary {
+		ppath = "main"
+	}
+	return ppath
+}
+
 func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
 	p := a.Package
 	objdir := a.Objdir
@@ -47,12 +61,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, s
 		ofile = objdir + out
 	}
 
-	pkgpath := p.ImportPath
-	if cfg.BuildBuildmode == "plugin" {
-		pkgpath = pluginPath(a)
-	} else if p.Name == "main" && !p.Internal.ForceLibrary {
-		pkgpath = "main"
-	}
+	pkgpath := pkgPath(a)
 	gcargs := []string{"-p", pkgpath}
 	if p.Module != nil && p.Module.GoVersion != "" && allowedVersion(p.Module.GoVersion) {
 		gcargs = append(gcargs, "-lang=go"+p.Module.GoVersion)
@@ -162,7 +171,7 @@ func gcBackendConcurrency(gcflags []string) int {
 CheckFlags:
 	for _, flag := range gcflags {
 		// Concurrent compilation is presumed incompatible with any gcflags,
-		// except for a small whitelist of commonly used flags.
+		// except for known commonly used flags.
 		// If the user knows better, they can manually add their own -c to the gcflags.
 		switch flag {
 		case "-N", "-l", "-S", "-B", "-C", "-I":
@@ -217,6 +226,10 @@ CheckFlags:
 // trimpath returns the -trimpath argument to use
 // when compiling the action.
 func (a *Action) trimpath() string {
+	// Keep in sync with Builder.ccompile
+	// The trimmed paths are a little different, but we need to trim in the
+	// same situations.
+
 	// Strip the object directory entirely.
 	objdir := a.Objdir
 	if len(objdir) > 1 && objdir[len(objdir)-1] == filepath.Separator {
@@ -227,8 +240,8 @@ func (a *Action) trimpath() string {
 	// For "go build -trimpath", rewrite package source directory
 	// to a file system-independent path (just the import path).
 	if cfg.BuildTrimpath {
-		if m := a.Package.Module; m != nil {
-			rewrite += ";" + m.Dir + "=>" + m.Path + "@" + m.Version
+		if m := a.Package.Module; m != nil && m.Version != "" {
+			rewrite += ";" + a.Package.Dir + "=>" + m.Path + "@" + m.Version + strings.TrimPrefix(a.Package.ImportPath, m.Path)
 		} else {
 			rewrite += ";" + a.Package.Dir + "=>" + a.Package.ImportPath
 		}
@@ -240,13 +253,23 @@ func (a *Action) trimpath() string {
 func asmArgs(a *Action, p *load.Package) []interface{} {
 	// Add -I pkg/GOOS_GOARCH so #include "textflag.h" works in .s files.
 	inc := filepath.Join(cfg.GOROOT, "pkg", "include")
-	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-trimpath", a.trimpath(), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, forcedAsmflags, p.Internal.Asmflags}
+	pkgpath := pkgPath(a)
+	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-p", pkgpath, "-trimpath", a.trimpath(), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, forcedAsmflags, p.Internal.Asmflags}
 	if p.ImportPath == "runtime" && cfg.Goarch == "386" {
 		for _, arg := range forcedAsmflags {
 			if arg == "-dynlink" {
 				args = append(args, "-D=GOBUILDMODE_shared=1")
 			}
 		}
+	}
+	if p.ImportPath == "runtime" && objabi.Regabi_enabled != 0 {
+		// In order to make it easier to port runtime assembly
+		// to the register ABI, we introduce a macro
+		// indicating the experiment is enabled.
+		//
+		// TODO(austin): Remove this once we commit to the
+		// register ABI (#40724).
+		args = append(args, "-D=GOEXPERIMENT_REGABI=1")
 	}
 
 	if cfg.Goarch == "mips" || cfg.Goarch == "mipsle" {
@@ -549,7 +572,7 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 
 	env := []string{}
 	if cfg.BuildTrimpath {
-		env = append(env, "GOROOT_FINAL=go")
+		env = append(env, "GOROOT_FINAL="+trimPathGoRootFinal)
 	}
 	return b.run(root, dir, root.Package.ImportPath, env, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags, mainpkg)
 }

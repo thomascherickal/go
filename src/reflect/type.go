@@ -16,6 +16,7 @@
 package reflect
 
 import (
+	"internal/unsafeheader"
 	"strconv"
 	"sync"
 	"unicode"
@@ -490,7 +491,7 @@ func (n name) name() (s string) {
 	}
 	b := (*[4]byte)(unsafe.Pointer(n.bytes))
 
-	hdr := (*stringHeader)(unsafe.Pointer(&s))
+	hdr := (*unsafeheader.String)(unsafe.Pointer(&s))
 	hdr.Data = unsafe.Pointer(&b[3])
 	hdr.Len = int(b[1])<<8 | int(b[2])
 	return s
@@ -502,7 +503,7 @@ func (n name) tag() (s string) {
 		return ""
 	}
 	nl := n.nameLen()
-	hdr := (*stringHeader)(unsafe.Pointer(&s))
+	hdr := (*unsafeheader.String)(unsafe.Pointer(&s))
 	hdr.Data = unsafe.Pointer(n.data(3+nl+2, "non-empty string"))
 	hdr.Len = tl
 	return s
@@ -646,7 +647,7 @@ func resolveNameOff(ptrInModule unsafe.Pointer, off int32) unsafe.Pointer
 // Implemented in the runtime package.
 func resolveTypeOff(rtype unsafe.Pointer, off int32) unsafe.Pointer
 
-// resolveTextOff resolves an function pointer offset from a base type.
+// resolveTextOff resolves a function pointer offset from a base type.
 // The (*rtype).textOff method is a convenience wrapper for this function.
 // Implemented in the runtime package.
 func resolveTextOff(rtype unsafe.Pointer, off int32) unsafe.Pointer
@@ -656,7 +657,7 @@ func resolveTextOff(rtype unsafe.Pointer, off int32) unsafe.Pointer
 // be resolved correctly. Implemented in the runtime package.
 func addReflectOff(ptr unsafe.Pointer) int32
 
-// resolveReflectType adds a name to the reflection lookup map in the runtime.
+// resolveReflectName adds a name to the reflection lookup map in the runtime.
 // It returns a new nameOff that can be used to refer to the pointer.
 func resolveReflectName(n name) nameOff {
 	return nameOff(addReflectOff(unsafe.Pointer(n.bytes)))
@@ -1788,7 +1789,6 @@ func ChanOf(dir ChanDir, t Type) Type {
 	}
 
 	// Look in known types.
-	// TODO: Precedence when constructing string.
 	var s string
 	switch dir {
 	default:
@@ -1798,7 +1798,16 @@ func ChanOf(dir ChanDir, t Type) Type {
 	case RecvDir:
 		s = "<-chan " + typ.String()
 	case BothDir:
-		s = "chan " + typ.String()
+		typeStr := typ.String()
+		if typeStr[0] == '<' {
+			// typ is recv chan, need parentheses as "<-" associates with leftmost
+			// chan possible, see:
+			// * https://golang.org/ref/spec#Channel_types
+			// * https://github.com/golang/go/issues/39897
+			s = "chan (" + typeStr + ")"
+		} else {
+			s = "chan " + typeStr
+		}
 	}
 	for _, tt := range typesByString(s) {
 		ch := (*chanType)(unsafe.Pointer(tt))
@@ -2371,6 +2380,7 @@ func StructOf(fields []StructField) Type {
 
 	lastzero := uintptr(0)
 	repr = append(repr, "struct {"...)
+	pkgpath := ""
 	for i, field := range fields {
 		if field.Name == "" {
 			panic("reflect.StructOf: field " + strconv.Itoa(i) + " has no name")
@@ -2381,10 +2391,17 @@ func StructOf(fields []StructField) Type {
 		if field.Type == nil {
 			panic("reflect.StructOf: field " + strconv.Itoa(i) + " has no type")
 		}
-		f := runtimeStructField(field)
+		f, fpkgpath := runtimeStructField(field)
 		ft := f.typ
 		if ft.kind&kindGCProg != 0 {
 			hasGCProg = true
+		}
+		if fpkgpath != "" {
+			if pkgpath == "" {
+				pkgpath = fpkgpath
+			} else if pkgpath != fpkgpath {
+				panic("reflect.Struct: fields with different PkgPath " + pkgpath + " and " + fpkgpath)
+			}
 		}
 
 		// Update string and hash
@@ -2617,6 +2634,9 @@ func StructOf(fields []StructField) Type {
 	prototype := *(**structType)(unsafe.Pointer(&istruct))
 	*typ = *prototype
 	typ.fields = fs
+	if pkgpath != "" {
+		typ.pkgPath = newName(pkgpath, "", false)
+	}
 
 	// Look in cache.
 	if ts, ok := structLookupCache.m.Load(hash); ok {
@@ -2741,7 +2761,10 @@ func StructOf(fields []StructField) Type {
 	return addToCache(&typ.rtype)
 }
 
-func runtimeStructField(field StructField) structField {
+// runtimeStructField takes a StructField value passed to StructOf and
+// returns both the corresponding internal representation, of type
+// structField, and the pkgpath value to use for this field.
+func runtimeStructField(field StructField) (structField, string) {
 	if field.Anonymous && field.PkgPath != "" {
 		panic("reflect.StructOf: field \"" + field.Name + "\" is anonymous but has PkgPath set")
 	}
@@ -2762,11 +2785,12 @@ func runtimeStructField(field StructField) structField {
 	}
 
 	resolveReflectType(field.Type.common()) // install in runtime
-	return structField{
+	f := structField{
 		name:        newName(field.Name, string(field.Tag), exported),
 		typ:         field.Type.common(),
 		offsetEmbed: offsetEmbed,
 	}
+	return f, field.PkgPath
 }
 
 // typeptrdata returns the length in bytes of the prefix of t
@@ -3052,6 +3076,7 @@ func ifaceIndir(t *rtype) bool {
 	return t.kind&kindDirectIface == 0
 }
 
+// Note: this type must agree with runtime.bitvector.
 type bitVector struct {
 	n    uint32 // number of bits
 	data []byte

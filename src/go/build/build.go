@@ -16,7 +16,6 @@ import (
 	"internal/goversion"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -36,13 +35,13 @@ type Context struct {
 	GOROOT string // Go root
 	GOPATH string // Go path
 
-	// WorkingDir is the caller's working directory, or the empty string to use
+	// Dir is the caller's working directory, or the empty string to use
 	// the current directory of the running process. In module mode, this is used
 	// to locate the main module.
 	//
-	// If WorkingDir is non-empty, directories passed to Import and ImportDir must
+	// If Dir is non-empty, directories passed to Import and ImportDir must
 	// be absolute.
-	WorkingDir string
+	Dir string
 
 	CgoEnabled  bool   // whether cgo files are included
 	UseAllFiles bool   // use files regardless of +build lines, file names
@@ -794,6 +793,12 @@ Found:
 		if d.IsDir() {
 			continue
 		}
+		if (d.Mode() & os.ModeSymlink) != 0 {
+			if fi, err := os.Stat(filepath.Join(p.Dir, d.Name())); err == nil && fi.IsDir() {
+				// Symlinks to directories are not source files.
+				continue
+			}
+		}
 
 		name := d.Name()
 		ext := nameExt(name)
@@ -905,6 +910,11 @@ Found:
 		}
 
 		// Record imports and information about cgo.
+		type importPos struct {
+			path string
+			pos  token.Pos
+		}
+		var fileImports []importPos
 		isCgo := false
 		for _, decl := range pf.Decls {
 			d, ok := decl.(*ast.GenDecl)
@@ -919,15 +929,9 @@ Found:
 				quoted := spec.Path.Value
 				path, err := strconv.Unquote(quoted)
 				if err != nil {
-					log.Panicf("%s: parser returned invalid quoted string: <%s>", filename, quoted)
+					panic(fmt.Sprintf("%s: parser returned invalid quoted string: <%s>", filename, quoted))
 				}
-				if isXTest {
-					xTestImported[path] = append(xTestImported[path], fset.Position(spec.Pos()))
-				} else if isTest {
-					testImported[path] = append(testImported[path], fset.Position(spec.Pos()))
-				} else {
-					imported[path] = append(imported[path], fset.Position(spec.Pos()))
-				}
+				fileImports = append(fileImports, importPos{path, spec.Pos()})
 				if path == "C" {
 					if isTest {
 						badFile(fmt.Errorf("use of cgo in test %s not supported", filename))
@@ -946,26 +950,35 @@ Found:
 				}
 			}
 		}
-		if isCgo {
+
+		var fileList *[]string
+		var importMap map[string][]token.Position
+		switch {
+		case isCgo:
 			allTags["cgo"] = true
 			if ctxt.CgoEnabled {
-				p.CgoFiles = append(p.CgoFiles, name)
+				fileList = &p.CgoFiles
+				importMap = imported
 			} else {
-				p.IgnoredGoFiles = append(p.IgnoredGoFiles, name)
+				// Ignore imports from cgo files if cgo is disabled.
+				fileList = &p.IgnoredGoFiles
 			}
-		} else if isXTest {
-			p.XTestGoFiles = append(p.XTestGoFiles, name)
-		} else if isTest {
-			p.TestGoFiles = append(p.TestGoFiles, name)
-		} else {
-			p.GoFiles = append(p.GoFiles, name)
+		case isXTest:
+			fileList = &p.XTestGoFiles
+			importMap = xTestImported
+		case isTest:
+			fileList = &p.TestGoFiles
+			importMap = testImported
+		default:
+			fileList = &p.GoFiles
+			importMap = imported
 		}
-	}
-	if badGoError != nil {
-		return p, badGoError
-	}
-	if len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles)+len(p.XTestGoFiles) == 0 {
-		return p, &NoGoError{p.Dir}
+		*fileList = append(*fileList, name)
+		if importMap != nil {
+			for _, imp := range fileImports {
+				importMap[imp.path] = append(importMap[imp.path], fset.Position(imp.pos))
+			}
+		}
 	}
 
 	for tag := range allTags {
@@ -985,6 +998,12 @@ Found:
 		sort.Strings(p.SFiles)
 	}
 
+	if badGoError != nil {
+		return p, badGoError
+	}
+	if len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles)+len(p.XTestGoFiles) == 0 {
+		return p, &NoGoError{p.Dir}
+	}
 	return p, pkgerr
 }
 
@@ -1001,8 +1020,6 @@ var errNoModules = errors.New("not using modules")
 // Then we reinvoke it for every dependency. But this is still better than not working at all.
 // See golang.org/issue/26504.
 func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) error {
-	const debugImportGo = false
-
 	// To invoke the go command,
 	// we must not being doing special things like AllowBinary or IgnoreVendor,
 	// and all the file system callbacks must be nil (we're meant to use the local file system).
@@ -1027,8 +1044,8 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 		var absSrcDir string
 		if filepath.IsAbs(srcDir) {
 			absSrcDir = srcDir
-		} else if ctxt.WorkingDir != "" {
-			return fmt.Errorf("go/build: WorkingDir is non-empty, so relative srcDir is not allowed: %v", srcDir)
+		} else if ctxt.Dir != "" {
+			return fmt.Errorf("go/build: Dir is non-empty, so relative srcDir is not allowed: %v", srcDir)
 		} else {
 			// Find the absolute source directory. hasSubdir does not handle
 			// relative paths (and can't because the callbacks don't support this).
@@ -1055,23 +1072,23 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 		}
 	}
 
-	// Unless GO111MODULE=on, look to see if there is a go.mod.
+	// If GO111MODULE=auto, look to see if there is a go.mod.
 	// Since go1.13, it doesn't matter if we're inside GOPATH.
-	if go111Module != "on" {
+	if go111Module == "auto" {
 		var (
 			parent string
 			err    error
 		)
-		if ctxt.WorkingDir == "" {
+		if ctxt.Dir == "" {
 			parent, err = os.Getwd()
 			if err != nil {
 				// A nonexistent working directory can't be in a module.
 				return errNoModules
 			}
 		} else {
-			parent, err = filepath.Abs(ctxt.WorkingDir)
+			parent, err = filepath.Abs(ctxt.Dir)
 			if err != nil {
-				// If the caller passed a bogus WorkingDir explicitly, that's materially
+				// If the caller passed a bogus Dir explicitly, that's materially
 				// different from not having modules enabled.
 				return err
 			}
@@ -1091,8 +1108,8 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 
 	cmd := exec.Command("go", "list", "-e", "-compiler="+ctxt.Compiler, "-tags="+strings.Join(ctxt.BuildTags, ","), "-installsuffix="+ctxt.InstallSuffix, "-f={{.Dir}}\n{{.ImportPath}}\n{{.Root}}\n{{.Goroot}}\n{{if .Error}}{{.Error}}{{end}}\n", "--", path)
 
-	if ctxt.WorkingDir != "" {
-		cmd.Dir = ctxt.WorkingDir
+	if ctxt.Dir != "" {
+		cmd.Dir = ctxt.Dir
 	}
 
 	var stdout, stderr strings.Builder
@@ -1121,15 +1138,15 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 	}
 	dir := f[0]
 	errStr := strings.TrimSpace(f[4])
-	if errStr != "" && p.Dir == "" {
-		// If 'go list' could not locate the package, return the same error that
-		// 'go list' reported.
-		// If 'go list' did locate the package (p.Dir is not empty), ignore the
-		// error. It was probably related to loading source files, and we'll
-		// encounter it ourselves shortly.
+	if errStr != "" && dir == "" {
+		// If 'go list' could not locate the package (dir is empty),
+		// return the same error that 'go list' reported.
 		return errors.New(errStr)
 	}
 
+	// If 'go list' did locate the package, ignore the error.
+	// It was probably related to loading source files, and we'll
+	// encounter it ourselves shortly if the FindOnly flag isn't set.
 	p.Dir = dir
 	p.ImportPath = f[1]
 	p.Root = f[2]
@@ -1737,6 +1754,9 @@ func (ctxt *Context) match(name string, allTags map[string]bool) bool {
 	if ctxt.GOOS == "illumos" && name == "solaris" {
 		return true
 	}
+	if ctxt.GOOS == "ios" && name == "darwin" {
+		return true
+	}
 
 	// other tags
 	for _, tag := range ctxt.BuildTags {
@@ -1764,7 +1784,10 @@ func (ctxt *Context) match(name string, allTags map[string]bool) bool {
 //     name_$(GOARCH)_test.*
 //     name_$(GOOS)_$(GOARCH)_test.*
 //
-// An exception: if GOOS=android, then files with GOOS=linux are also matched.
+// Exceptions:
+// if GOOS=android, then files with GOOS=linux are also matched.
+// if GOOS=illumos, then files with GOOS=solaris are also matched.
+// if GOOS=ios, then files with GOOS=darwin are also matched.
 func (ctxt *Context) goodOSArchFile(name string, allTags map[string]bool) bool {
 	if dot := strings.Index(name, "."); dot != -1 {
 		name = name[:dot]

@@ -6,15 +6,16 @@ env GOFLAGS=-mod=readonly
 go mod edit -fmt
 cp go.mod go.mod.empty
 ! go list all
-stderr 'import lookup disabled by -mod=readonly'
+stderr '^x.go:2:8: cannot find module providing package rsc\.io/quote: import lookup disabled by -mod=readonly'
+! stderr '\(\)' # If we don't have a reason for -mod=readonly, don't log an empty one.
 cmp go.mod go.mod.empty
 
-# -mod=readonly should be set implicitly if the go.mod file is read-only
-chmod 0400 go.mod
+# -mod=readonly should be set by default.
 env GOFLAGS=
 ! go list all
+stderr '^x.go:2:8: cannot find module providing package rsc\.io/quote$'
+cmp go.mod go.mod.empty
 
-chmod 0600 go.mod
 env GOFLAGS=-mod=readonly
 
 # update go.mod - go get allowed
@@ -33,6 +34,11 @@ go list all
 go clean -modcache
 go list all
 
+# -mod=readonly must not cause 'go list -m' to fail.
+# (golang.org/issue/36478)
+go list -m all
+! stderr 'cannot query module'
+
 # -mod=readonly should reject inconsistent go.mod files
 # (ones that would be rewritten).
 go mod edit -require rsc.io/sampler@v1.2.0
@@ -41,18 +47,26 @@ cp go.mod go.mod.inconsistent
 stderr 'go: updates to go.mod needed, disabled by -mod=readonly'
 cmp go.mod go.mod.inconsistent
 
+# We get a different message when -mod=readonly is used by default.
+env GOFLAGS=
+! go list
+stderr '^go: updates to go.mod needed; try ''go mod tidy'' first$'
+
 # However, it should not reject files missing a 'go' directive,
 # since that was not always required.
 cp go.mod.nogo go.mod
 go list all
+cmp go.mod go.mod.nogo
 
 # Nor should it reject files with redundant (not incorrect)
 # requirements.
 cp go.mod.redundant go.mod
 go list all
+cmp go.mod go.mod.redundant
 
 cp go.mod.indirect go.mod
 go list all
+cmp go.mod go.mod.indirect
 
 -- go.mod --
 module m
